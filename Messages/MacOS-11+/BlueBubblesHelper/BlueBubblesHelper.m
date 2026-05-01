@@ -702,6 +702,66 @@ NSMutableArray* vettedAliases;
             };
             [[NetworkController sharedInstance] sendMessage:data];
         }
+    // If the server tells us to write the personal Share Name and Photo
+    } else if ([event isEqualToString:@"set-nickname-info"]) {
+        NSString *displayName = data[@"displayName"];
+        NSString *avatarPath = data[@"avatarPath"];
+        NSString *avatarBytes = data[@"avatarBytes"];
+
+        if (displayName == nil || (id)displayName == [NSNull null] || [displayName length] == 0) {
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"error": @"displayName is required"}];
+            }
+            return;
+        }
+
+        // Split displayName into first/last for IMNickname's initWithFirstName:lastName:avatar:
+        NSString *firstName = displayName;
+        NSString *lastName = @"";
+        NSRange spaceRange = [displayName rangeOfString:@" "];
+        if (spaceRange.location != NSNotFound) {
+            firstName = [displayName substringToIndex:spaceRange.location];
+            lastName = [[displayName substringFromIndex:(spaceRange.location + 1)] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        }
+
+        // Resolve avatar image data + on-disk path. IMNicknameAvatarImage prefers a path Apple controls.
+        NSData *imageData = nil;
+        NSString *resolvedAvatarPath = nil;
+        if (avatarPath != nil && (id)avatarPath != [NSNull null] && [avatarPath length] > 0) {
+            imageData = [NSData dataWithContentsOfFile:avatarPath];
+            resolvedAvatarPath = avatarPath;
+        } else if (avatarBytes != nil && (id)avatarBytes != [NSNull null] && [avatarBytes length] > 0) {
+            imageData = [[NSData alloc] initWithBase64EncodedString:avatarBytes options:NSDataBase64DecodingIgnoreUnknownCharacters];
+        }
+
+        IMNicknameAvatarImage *avatar = nil;
+        if (imageData != nil) {
+            // Copy bytes into the path Apple expects so the avatar persists across syncs.
+            NSString *destPath = [IMNickname uniqueFilePathForWritingImageData];
+            NSError *writeError = nil;
+            avatar = [[IMNicknameAvatarImage alloc] initWithImageName:displayName imageData:imageData imageFilePath:(destPath ?: resolvedAvatarPath) error:&writeError];
+            if (avatar == nil && resolvedAvatarPath != nil) {
+                avatar = [[IMNicknameAvatarImage alloc] initWithImageName:displayName imageFilePath:resolvedAvatarPath];
+            }
+        }
+
+        IMNickname *nickname = [[IMNickname alloc] initWithFirstName:firstName lastName:lastName avatar:avatar];
+        [nickname setDisplayName:displayName];
+
+        IMNicknameController *controller = [IMNicknameController sharedInstance];
+        [controller updatePersonalNickname:nickname];
+        // Persist locally so Messages.app picks it up on next launch as well as immediately.
+        if ([controller respondsToSelector:@selector(_updateLocalNicknameStore)]) {
+            [controller _updateLocalNicknameStore];
+        }
+
+        if (transaction != nil) {
+            [[NetworkController sharedInstance] sendMessage: @{
+                @"transactionId": transaction,
+                @"name": displayName,
+                @"avatar_path": resolvedAvatarPath ?: [NSNull null],
+            }];
+        }
     // If the server tells us to get the current account info
     } else if ([event isEqualToString:@"get-account-info"]) {
         IMAccountController *controller = [IMAccountController sharedInstance];
