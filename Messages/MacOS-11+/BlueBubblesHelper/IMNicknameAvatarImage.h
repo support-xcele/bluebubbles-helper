@@ -30,7 +30,9 @@
 - (id) imageFilePath;
 - (void) setImageFilePath:(id)arg1;
 - (id) initWithImageName:(id)arg1 imageFilePath:(id)arg2;
+- (id) initWithImageName:(id)arg1 imageFilePath:(id)arg2 contentIsSensitive:(BOOL)arg3;
 - (id) initWithImageName:(id)arg1 imageData:(id)arg2 imageFilePath:(id)arg3 error:(id*)arg4;
+- (id) initWithImageName:(id)arg1 imageData:(id)arg2 imageFilePath:(id)arg3 contentIsSensitive:(BOOL)arg4 error:(id*)arg5;
 - (BOOL) _writeImageData:(id)arg1 path:(id)arg2 error:(id*)arg3;
 - (id) initWithPublicDictionaryMetadataRepresentation:(id)arg1;
 - (id) initWithImageName:(id)arg1 imageData:(id)arg2 imageFilePath:(id)arg3;

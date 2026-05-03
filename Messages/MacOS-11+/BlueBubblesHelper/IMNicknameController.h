@@ -49,8 +49,15 @@
 -(void)_broadcastNicknamePreferencesDidChange:(id)arg0 ;
 -(void)_meCardDidChange:(id)arg0 ;
 -(void)_updateLocalNicknameStore;
+-(void)updateLocalNicknameStore;
+-(void)setPersonalNickname:(id)arg0;
+-(void)setPersonalNicknameFromOnboardingResult:(id)arg0;
+-(BOOL)_canUpdatePersonalNickname;
+-(BOOL)_nicknameFeatureEnabled;
 -(void)_updatePersonalNicknameWithMeCardIfNecessary;
 -(void)allowHandlesForNicknameSharing:(id)arg0 forChat:(id)arg1 ;
+-(void)allowHandlesForNicknameSharing:(id)arg0 forChat:(id)arg1 fromHandle:(id)arg2 forceSend:(BOOL)arg3;
+-(void)allowHandlesForNicknameSharing:(id)arg0 fromHandle:(id)arg1 forceSend:(BOOL)arg2;
 -(void)whitelistHandlesForNicknameSharing:(id)arg1 forChat:(id)arg2;
 -(void)clearHandleFromScrutiny:(id)arg0 ;
 -(void)clearPendingNicknameUpdatesForHandle:(id)arg0 ;

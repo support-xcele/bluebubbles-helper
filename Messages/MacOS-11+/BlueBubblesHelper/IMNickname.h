@@ -45,6 +45,7 @@
 - (id) imageHash;
 - (id) publicDictionaryRepresentation;
 - (id) initWithFirstName:(id)arg1 lastName:(id)arg2 avatar:(id)arg3;
+- (id) initWithFirstName:(id)arg1 lastName:(id)arg2 avatar:(id)arg3 pronouns:(id)arg4;
 - (id) _imageHashCreatedInChunks;
 - (id) nameHash;
 - (id) initWithMeContact:(id)arg1;

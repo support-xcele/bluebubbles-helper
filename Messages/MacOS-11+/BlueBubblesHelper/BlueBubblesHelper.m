@@ -10,6 +10,7 @@
 
 #import <Foundation/Foundation.h>
 #import <CoreSpotlight/CoreSpotlight.h>
+#import <objc/message.h>
 
 #import "IMTextMessagePartChatItem.h"
 #import "IMHandle.h"
@@ -117,10 +118,167 @@ NSMutableArray* vettedAliases;
         dispatch_after(popTime, dispatch_get_main_queue(), ^(void){
             DLog("BLUEBUBBLESHELPER: Initializing Connection...");
             [plugin initializeNetworkController];
+            [BlueBubblesHelper installAutoShareNicknameHook];
         });
     } else {
         DLog("BLUEBUBBLESHELPER: Injected into non-iMessage process %@, aborting.", [[NSBundle mainBundle] bundleIdentifier]);
         return;
+    }
+}
+
+// Auto-allow Share Name and Photo for every chat — bulk for existing chats, observer
+// for future chats. Required for OF creator outbound traffic at scale: receivers see
+// Elli Lacy + photo without any per-conversation "Share?" prompt on the operator side.
++ (void)installAutoShareNicknameHook {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // Future chats: subscribe to chat-registered notification.
+        [[NSNotificationCenter defaultCenter] addObserverForName:@"__kIMChatRegistryDidRegisterChatNotification"
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification *note) {
+            IMChat *chat = note.userInfo[@"chat"];
+            if (chat == nil && [note.object isKindOfClass:NSClassFromString(@"IMChat")]) {
+                chat = note.object;
+            }
+            if (chat == nil) return;
+            [BlueBubblesHelper allowShareForChat:chat];
+        }];
+        // Existing chats: bulk-allow on first install.
+        [BlueBubblesHelper allowShareForAllExistingChats];
+        DLog("BLUEBUBBLESHELPER: auto-share-nickname hook installed");
+    });
+}
+
++ (void)allowShareForAllExistingChats {
+    IMChatRegistry *reg = [IMChatRegistry sharedInstance];
+    NSArray *chats = [reg respondsToSelector:@selector(allChats)] ? [reg performSelector:@selector(allChats)] : nil;
+    for (IMChat *chat in chats) {
+        [BlueBubblesHelper allowShareForChat:chat];
+    }
+}
+
++ (void)allowShareForChat:(IMChat *)chat {
+    if (chat == nil) return;
+    NSArray *participants = [chat participants];
+    if (participants.count == 0) return;
+    IMNicknameController *ctrl = [IMNicknameController sharedInstance];
+    NSString *fromHandle = nil;
+    if ([chat respondsToSelector:@selector(lastAddressedHandleID)]) {
+        fromHandle = [chat performSelector:@selector(lastAddressedHandleID)];
+    }
+    if ([ctrl respondsToSelector:@selector(allowHandlesForNicknameSharing:forChat:fromHandle:forceSend:)]) {
+        [ctrl allowHandlesForNicknameSharing:participants forChat:chat fromHandle:fromHandle forceSend:YES];
+    } else if ([ctrl respondsToSelector:@selector(allowHandlesForNicknameSharing:forChat:)]) {
+        [ctrl performSelector:@selector(allowHandlesForNicknameSharing:forChat:) withObject:participants withObject:chat];
+    }
+    [BlueBubblesHelper autoAddParticipantsToContactsForChat:chat];
+}
+
+// Auto-create CNMutableContact entries for every chat participant who isn't already
+// in the macOS address book. Required because Apple's share-card delivery is most
+// reliable when the recipient handle is "known" (in Contacts). Also gives the operator
+// a CRM-style record of every fan/lead the AI workflow has touched.
++ (void)autoAddParticipantsToContactsForChat:(IMChat *)chat {
+    if (chat == nil) return;
+    NSArray *participants = [chat participants];
+    if (participants.count == 0) return;
+
+    // Lazy-load Contacts.framework — not linked at build time so we don't pull in
+    // an unnecessary dependency and don't break injection on older macOS.
+    static dispatch_once_t once;
+    static BOOL frameworkLoaded = NO;
+    dispatch_once(&once, ^{
+        NSBundle *b = [NSBundle bundleWithPath:@"/System/Library/Frameworks/Contacts.framework"];
+        frameworkLoaded = (b && [b load]);
+    });
+    if (!frameworkLoaded) return;
+
+    Class CNContactStoreCls = NSClassFromString(@"CNContactStore");
+    Class CNMutableContactCls = NSClassFromString(@"CNMutableContact");
+    Class CNPhoneNumberCls = NSClassFromString(@"CNPhoneNumber");
+    Class CNLabeledValueCls = NSClassFromString(@"CNLabeledValue");
+    Class CNSaveRequestCls = NSClassFromString(@"CNSaveRequest");
+    if (!CNContactStoreCls || !CNMutableContactCls || !CNSaveRequestCls) return;
+
+    // Check Contacts authorization state. If NotDetermined (0), request access — Apple will
+    // show the user a system prompt the first time. Subsequent calls remember the answer.
+    // We block on a semaphore so the save below has authoritative state.
+    static dispatch_once_t authOnce;
+    static long authStatus = 0;
+    dispatch_once(&authOnce, ^{
+        long status = ((long (*)(Class, SEL, long))objc_msgSend)(
+            CNContactStoreCls, @selector(authorizationStatusForEntityType:), 0L);
+        if (status == 0) { // CNAuthorizationStatusNotDetermined
+            id tempStore = [[CNContactStoreCls alloc] init];
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            __block BOOL gotGranted = NO;
+            __block NSError *gotErr = nil;
+            ((void (*)(id, SEL, long, void(^)(BOOL, NSError *)))objc_msgSend)(
+                tempStore, @selector(requestAccessForEntityType:completionHandler:),
+                0L,
+                ^(BOOL granted, NSError *err) {
+                    gotGranted = granted;
+                    gotErr = err;
+                    dispatch_semaphore_signal(sem);
+                });
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC));
+            authStatus = gotGranted ? 3 : 2;
+            DLog("BLUEBUBBLESHELPER: Contacts auth result granted=%d err=%{public}@", (int)gotGranted, gotErr);
+        } else {
+            authStatus = status;
+            DLog("BLUEBUBBLESHELPER: Contacts auth status was already=%ld", status);
+        }
+    });
+    if (authStatus != 3) {
+        // Not authorized — bail. User needs to grant via System Settings → Privacy → Contacts.
+        return;
+    }
+
+    id store = [[CNContactStoreCls alloc] init];
+
+    for (id handle in participants) {
+        NSString *handleId = nil;
+        if ([handle respondsToSelector:@selector(ID)]) {
+            handleId = [handle performSelector:@selector(ID)];
+        }
+        if (handleId.length == 0) continue;
+
+        BOOL isEmail = [handleId rangeOfString:@"@"].location != NSNotFound;
+
+        id contact = [[CNMutableContactCls alloc] init];
+        // Placeholder name: lets the operator easily filter "auto-imported" leads later.
+        [contact performSelector:@selector(setGivenName:) withObject:(isEmail ? handleId : [@"+" stringByAppendingString:[handleId stringByReplacingOccurrencesOfString:@"+" withString:@""]])];
+        [contact performSelector:@selector(setFamilyName:) withObject:@"(iMessage Lead)"];
+
+        if (isEmail && CNLabeledValueCls) {
+            id labeled = ((id (*)(Class, SEL, id, id))objc_msgSend)(
+                CNLabeledValueCls, @selector(labeledValueWithLabel:value:),
+                @"_$!<Other>!$_", handleId);
+            if (labeled) {
+                [contact performSelector:@selector(setEmailAddresses:) withObject:@[labeled]];
+            }
+        } else if (CNPhoneNumberCls && CNLabeledValueCls) {
+            id phone = ((id (*)(Class, SEL, id))objc_msgSend)(
+                CNPhoneNumberCls, @selector(phoneNumberWithStringValue:), handleId);
+            id labeled = ((id (*)(Class, SEL, id, id))objc_msgSend)(
+                CNLabeledValueCls, @selector(labeledValueWithLabel:value:),
+                @"_$!<Mobile>!$_", phone);
+            if (labeled) {
+                [contact performSelector:@selector(setPhoneNumbers:) withObject:@[labeled]];
+            }
+        }
+
+        id saveReq = [[CNSaveRequestCls alloc] init];
+        ((void (*)(id, SEL, id, id))objc_msgSend)(
+            saveReq, @selector(addContact:toContainerWithIdentifier:), contact, nil);
+
+        NSError *saveErr = nil;
+        BOOL ok = ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(
+            store, @selector(executeSaveRequest:error:), saveReq, &saveErr);
+        if (!ok) {
+            DLog("BLUEBUBBLESHELPER: Contacts auto-add failed for %{public}@: %{public}@", handleId, saveErr);
+        }
     }
 }
 
@@ -429,6 +587,56 @@ NSMutableArray* vettedAliases;
         [mutableData setValue:[chat guid] forKey:@"chatGuid"];
         [BlueBubblesHelper sendMessage:(mutableData) transfers:nil attributedString:nil transaction:(transaction)];
     // If server tells us to delete a chat
+    // Block / unblock a handle (Apple ID address or phone number).
+    //
+    // The IMHandle.h dump suggests setBlocked:/isBlocked but at runtime
+    // those don't exist on macOS Sequoia+ — class_copyMethodList shows
+    // the actual selectors are `setBlockedStatus:` (setter, takes an
+    // unsigned int) and `blockedStatus` (getter). Calling setBlocked:
+    // raises NSInvalidArgumentException ("unrecognized selector"), which
+    // is what the v1 of this handler did. We use `setBlockedStatus:` via
+    // an explicit performSelector:withObject: to keep ARC + clang happy
+    // without needing a forward declaration.
+    //
+    // data[@"address"] (string, required)  the address to (un)block
+    // data[@"block"]   (bool,   optional)  true = block, false = unblock; default true
+    } else if ([event isEqualToString:@"block-handle"]) {
+        if (data[@"address"] == nil) {
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"error": @"Provide an address to (un)block!"}];
+            }
+            return;
+        }
+        IMHandle *handle = [[[IMAccountController sharedInstance] activeIMessageAccount] imHandleWithID:(data[@"address"])];
+        if (handle == nil) {
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"error": @"Handle not found for address!"}];
+            }
+            DLog("BLUEBUBBLESHELPER: block-handle: no IMHandle for %{public}@", data[@"address"]);
+            return;
+        }
+        BOOL block = data[@"block"] == nil ? YES : [data[@"block"] boolValue];
+        SEL setSel = NSSelectorFromString(@"setBlockedStatus:");
+        SEL getSel = NSSelectorFromString(@"blockedStatus");
+        if (![handle respondsToSelector:setSel] || ![handle respondsToSelector:getSel]) {
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"error": @"IMHandle does not respond to setBlockedStatus: on this macOS"}];
+            }
+            return;
+        }
+        // setBlockedStatus: takes an unsigned int. 0 = unblocked, 1 = blocked
+        // (matches what Messages.app's Block Contact toggle flips).
+        unsigned int newStatus = block ? 1u : 0u;
+        ((void (*)(id, SEL, unsigned int))objc_msgSend)(handle, setSel, newStatus);
+        unsigned int post = ((unsigned int (*)(id, SEL))objc_msgSend)(handle, getSel);
+        if (transaction != nil) {
+            [[NetworkController sharedInstance] sendMessage: @{
+                @"transactionId": transaction,
+                @"blockedStatus": @(post),
+                @"isBlocked": @(post != 0u),
+            }];
+        }
+        DLog("BLUEBUBBLESHELPER: %{public}@ %{public}@ (blockedStatus=%{public}@)", block ? @"Blocked" : @"Unblocked", data[@"address"], @(post));
     } else if ([event isEqualToString:@"delete-chat"]) {
         IMChat *chat = [BlueBubblesHelper getChat: data[@"chatGuid"] :transaction];
 
@@ -739,27 +947,41 @@ NSMutableArray* vettedAliases;
             // Copy bytes into the path Apple expects so the avatar persists across syncs.
             NSString *destPath = [IMNickname uniqueFilePathForWritingImageData];
             NSError *writeError = nil;
-            avatar = [[IMNicknameAvatarImage alloc] initWithImageName:displayName imageData:imageData imageFilePath:(destPath ?: resolvedAvatarPath) error:&writeError];
+            avatar = [[IMNicknameAvatarImage alloc] initWithImageName:displayName imageData:imageData imageFilePath:(destPath ?: resolvedAvatarPath) contentIsSensitive:NO error:&writeError];
             if (avatar == nil && resolvedAvatarPath != nil) {
-                avatar = [[IMNicknameAvatarImage alloc] initWithImageName:displayName imageFilePath:resolvedAvatarPath];
+                avatar = [[IMNicknameAvatarImage alloc] initWithImageName:displayName imageFilePath:resolvedAvatarPath contentIsSensitive:NO];
             }
         }
 
-        IMNickname *nickname = [[IMNickname alloc] initWithFirstName:firstName lastName:lastName avatar:avatar];
+        IMNickname *nickname = [[IMNickname alloc] initWithFirstName:firstName lastName:lastName avatar:avatar pronouns:nil];
         [nickname setDisplayName:displayName];
 
         IMNicknameController *controller = [IMNicknameController sharedInstance];
+        // Raw property setter writes the ivar directly, bypassing Apple's first-time
+        // setup gate (_canUpdatePersonalNickname / _nicknameFeatureEnabled). This is
+        // what makes 20+ iCloud accounts/Mac viable without manual onboarding clicks.
+        if ([controller respondsToSelector:@selector(setPersonalNickname:)]) {
+            [controller setPersonalNickname:nickname];
+        }
+        // Broadcast/sync — propagates to iCloud and triggers share-card delivery
+        // to recipients. Skipped silently by Apple if the gate is closed, but the
+        // raw setter above already populated the local state.
         [controller updatePersonalNickname:nickname];
-        // Persist locally so Messages.app picks it up on next launch as well as immediately.
-        if ([controller respondsToSelector:@selector(_updateLocalNicknameStore)]) {
-            [controller _updateLocalNicknameStore];
+        if ([controller respondsToSelector:@selector(updateLocalNicknameStore)]) {
+            [controller updateLocalNicknameStore];
         }
 
         if (transaction != nil) {
+            BOOL canUpdate = [controller respondsToSelector:@selector(_canUpdatePersonalNickname)] ? [controller _canUpdatePersonalNickname] : NO;
+            BOOL featureEnabled = [controller respondsToSelector:@selector(_nicknameFeatureEnabled)] ? [controller _nicknameFeatureEnabled] : NO;
+            IMNickname *readBack = [controller personalNickname];
             [[NetworkController sharedInstance] sendMessage: @{
                 @"transactionId": transaction,
                 @"name": displayName,
                 @"avatar_path": resolvedAvatarPath ?: [NSNull null],
+                @"can_update": @(canUpdate),
+                @"feature_enabled": @(featureEnabled),
+                @"read_back_name": [readBack displayName] ?: [NSNull null],
             }];
         }
     // If the server tells us to get the current account info
